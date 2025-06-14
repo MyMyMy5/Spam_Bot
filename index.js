@@ -17,6 +17,7 @@ const botConfig = require('./config'); //Loads our shared configurtaion manager.
 // * Blacklist
 // * Admins
 // And it persists these settings to disk.
+const cron = require('node-cron');
 const {
     hasPassedTest , //Checks if a user passed the verification quiz.
     addApprovedUser,//Marks user as approved (Writes to JSON via botConfig)
@@ -3088,5 +3089,247 @@ async function addUserToBlacklistWithLid(message, addToBlacklist) {
         results.errors.push({type: 'general', message: error.message});
         console.error('General error in blacklisting user:', error);
         return results;
+    }
+}
+cron.schedule(
+  '0 4 * * *',
+  async () => {
+    try {
+      console.log('[CRON] 04:00 job started');
+
+      // 👉 2nd scheduled action
+      await approveGroupRequests(null, {}, client);
+      //    (replace with whatever you need)
+
+      console.log('[CRON] 04:00 job completed');
+    } catch (err) {
+      console.error('[CRON] 04:00 job FAILED:', err);
+    }
+  },
+  {
+    scheduled: true,
+    timezone: 'Asia/Jerusalem',   // guarantees “4 AM” is local Israeli time
+  }
+);
+async function approveGroupRequests(groupId = null, options = {}, client) {
+    try {
+        let blacklist = [];
+        try {
+            const blacklistData = fs.readFileSync(path.join(__dirname, 'blacklist.json'), 'utf8');
+            blacklist = JSON.parse(blacklistData);
+        } catch (error) {
+            console.error('Error loading blacklist:', error);
+            blacklist = [];
+        }
+
+        if (groupId) {
+            const chat = await client.getChatById(groupId);
+            const botContact = await client.getContactById(client.info.wid._serialized);
+            const isAdmin = chat.participants.some(p =>
+                p.id._serialized === botContact.id._serialized &&
+                (p.isAdmin || p.isSuperAdmin)
+            );
+
+            if (!isAdmin) {
+                return `❌ Bot is not admin in group ${groupId}`;
+            }
+
+            const membershipRequests = await client.getGroupMembershipRequests(groupId);
+            if (membershipRequests.length === 0) {
+                return `✅ No pending membership requests for group ${groupId}`;
+            }
+
+            console.log('Raw membership requests:', JSON.stringify(membershipRequests, null, 2));
+
+            const allowedRequesterIds = [];
+            const blockedRequesters = [];
+
+            for (const request of membershipRequests) {
+                let requesterId = null;
+                try {
+                    if (typeof request.author === 'string') {
+                        requesterId = request.author;
+                    } else if (request.author && request.author._serialized) {
+                        requesterId = request.author._serialized;
+                    } else if (request.id && typeof request.id === 'string') {
+                        requesterId = request.id;
+                    } else if (request.id && request.id._serialized) {
+                        requesterId = request.id._serialized;
+                    } else if (request.requester) {
+                        if (typeof request.requester === 'string') {
+                            requesterId = request.requester;
+                        } else if (request.requester._serialized) {
+                            requesterId = request.requester._serialized;
+                        }
+                    } else if (request.addedBy) {
+                        if (typeof request.addedBy === 'string') {
+                            requesterId = request.addedBy;
+                        } else if (request.addedBy._serialized) {
+                            requesterId = request.addedBy._serialized;
+                        }
+                    }
+
+                    console.log(`Extracted requester ID: ${requesterId} from request:`, request);
+                    if (requesterId) {
+                        if (!blacklist.includes(requesterId)) {
+                            allowedRequesterIds.push(requesterId);
+                        } else {
+                            blockedRequesters.push(requesterId);
+                            console.log(`Blocked requester: ${requesterId} (in blacklist)`);
+                        }
+                    } else {
+                        console.error('Could not extract requester ID from request:', request);
+                    }
+                } catch (extractionError) {
+                    console.error('Error extracting requester ID:', extractionError);
+                    console.error('Request object:', request);
+                }
+            }
+
+            if (allowedRequesterIds.length === 0) {
+                const totalBlocked = blockedRequesters.length;
+                const totalFailed = membershipRequests.length - blockedRequesters.length;
+                return `⚠️ No valid requests to approve. Blacklisted: ${totalBlocked}, Failed to process: ${totalFailed}`;
+            }
+
+            console.log(`Approving ${allowedRequesterIds.length} requests:`, allowedRequesterIds);
+
+            try {
+                const results = await client.approveGroupMembershipRequests(groupId, {
+                    requesterIds: allowedRequesterIds,
+                    ...options
+                });
+                const blockedCount = blockedRequesters.length;
+                return `✅ Processed ${results.length} membership requests for group ${groupId}\n` +
+                    `📋 Approved: ${allowedRequesterIds.length}\n` +
+                    `🚫 Blocked (blacklisted): ${blockedCount}`;
+            } catch (approvalError) {
+                console.error('Error during approval:', approvalError);
+                console.error('Attempted to approve IDs:', allowedRequesterIds);
+
+                let successCount = 0;
+                for (const id of allowedRequesterIds) {
+                    try {
+                        await client.approveGroupMembershipRequests(groupId, {
+                            requesterIds: [id]
+                        });
+                        successCount++;
+                    } catch (individualError) {
+                        console.error(`Failed to approve ${id}:`, individualError.message);
+                    }
+                }
+
+                return `⚠️ Partial approval: ${successCount}/${allowedRequesterIds.length} approved\n` +
+                    `🚫 Blocked (blacklisted): ${blockedRequesters.length}\n` +
+                    `❌ Some requests failed. See console for details.`;
+            }
+        } else {
+            const chats = await client.getChats();
+            const groups = chats.filter(chat => chat.isGroup);
+            let totalApproved = 0;
+            let totalBlocked = 0;
+            let adminGroups = 0;
+            let nonAdminGroups = 0;
+            let processedGroups = [];
+
+            for (const group of groups) {
+                try {
+                    const botContact = await client.getContactById(client.info.wid._serialized);
+                    const isAdmin = group.participants.some(p =>
+                        p.id._serialized === botContact.id._serialized &&
+                        (p.isAdmin || p.isSuperAdmin)
+                    );
+
+                    if (isAdmin) {
+                        adminGroups++;
+                        const membershipRequests = await client.getGroupMembershipRequests(group.id._serialized);
+                        
+                        if (membershipRequests.length > 0) {
+                            console.log(`Processing ${membershipRequests.length} requests for group ${group.name}`);
+                            const allowedRequesterIds = [];
+                            const blockedRequesters = [];
+
+                            for (const request of membershipRequests) {
+                                let requesterId = null;
+                                try {
+                                    if (typeof request.author === 'string') {
+                                        requesterId = request.author;
+                                    } else if (request.author && request.author._serialized) {
+                                        requesterId = request.author._serialized;
+                                    } else if (request.id && typeof request.id === 'string') {
+                                        requesterId = request.id;
+                                    } else if (request.id && request.id._serialized) {
+                                        requesterId = request.id._serialized;
+                                    } else if (request.requester) {
+                                        if (typeof request.requester === 'string') {
+                                            requesterId = request.requester;
+                                        } else if (request.requester._serialized) {
+                                            requesterId = request.requester._serialized;
+                                        }
+                                    } else if (request.addedBy) {
+                                        if (typeof request.addedBy === 'string') {
+                                            requesterId = request.addedBy;
+                                        } else if (request.addedBy._serialized) {
+                                            requesterId = request.addedBy._serialized;
+                                        }
+                                    }
+
+                                    if (requesterId) {
+                                        if (!blacklist.includes(requesterId)) {
+                                            allowedRequesterIds.push(requesterId);
+                                        } else {
+                                            blockedRequesters.push(requesterId);
+                                        }
+                                    }
+                                } catch (extractionError) {
+                                    console.error(`Error extracting requester ID in group ${group.name}:`, extractionError);
+                                }
+                            }
+
+                            const blockedCount = blockedRequesters.length;
+                            totalBlocked += blockedCount;
+
+                            if (allowedRequesterIds.length > 0) {
+                                try {
+                                    const results = await client.approveGroupMembershipRequests(group.id._serialized, {
+                                        requesterIds: allowedRequesterIds,
+                                        ...options
+                                    });
+                                    totalApproved += results.length;
+                                    processedGroups.push(`${group.name}: approved ${results.length}, blocked ${blockedCount}`);
+                                    console.log(`Approved ${results.length} requests in ${group.name} (blocked ${blockedCount} blacklisted users)`);
+                                } catch (approvalError) {
+                                    console.error(`Error approving requests for ${group.name}:`, approvalError.message);
+                                    processedGroups.push(`${group.name}: error - ${approvalError.message}`);
+                                }
+                            } else {
+                                processedGroups.push(`${group.name}: no valid requests (${membershipRequests.length} total)`);
+                                console.log(`Skipped ${group.name} - no valid requests to approve`);
+                            }
+                        }
+                    } else {
+                        nonAdminGroups++;
+                        console.log(`Skipped ${group.name} - bot not admin`);
+                    }
+                } catch (error) {
+                    console.error(`Error processing ${group.name}:`, error.message);
+                    console.error('Full error:', error);
+                }
+            }
+
+            let report = `✅ Approved ${totalApproved} total requests across ${adminGroups} groups\n` +
+                `🚫 Blocked ${totalBlocked} blacklisted users\n` +
+                `⚠️ Skipped ${nonAdminGroups} groups (not admin)`;
+
+            if (processedGroups.length > 0) {
+                report += `\n\n📋 Group Details:\n${processedGroups.join('\n')}`;
+            }
+
+            return report;
+        }
+    } catch (error) {
+        console.error('Error approving membership requests:', error);
+        console.error('Error stack:', error.stack);
+        return '❌ Error processing membership requests with blacklist filtering';
     }
 }
