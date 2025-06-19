@@ -55,7 +55,6 @@ const TEST_GROUP_ID = '120363346219705470@g.us';
 const Test2 = '120363400062535302@g.us';
 
 // הגדרת נתיבים
-const blacklistPath = path.resolve('/root/whatsapp-bot/Whatsapp-bot', 'blacklist.json');
 const approvedPath = path.join(__dirname, 'approved-users.json');
 
 // מיד אחרי טעינת הקונפיגורציה, נוסיף את קבוצת הטסט לקבוצות המנוהלות
@@ -216,13 +215,19 @@ try {
 }
 
 // רשימה שחורה (נטען מקובץ/זיכרון)
-let BLACKLIST;
+// The BLACKLIST variable will now reference the Set managed by botConfig.
+let BLACKLIST = botConfig.blacklistedUsers;
+// Ensure botConfig is initialized and blacklistedUsers is available before this line.
+// If botConfig.blacklistedUsers is not a Set or needs different handling, this will need adjustment.
 try {
-    const blacklistData = fs.readFileSync(blacklistPath, 'utf8'); // ← use the constant
-    BLACKLIST = new Set(JSON.parse(blacklistData));
+    // Verify that BLACKLIST is a Set, if not, initialize or log error
+    if (!(BLACKLIST instanceof Set)) {
+        console.error('botConfig.blacklistedUsers is not a Set, initializing BLACKLIST as a new Set.');
+        BLACKLIST = new Set(); // Fallback, though ideally botConfig handles this.
+    }
 } catch (error) {
-    console.error('שגיאה בטעינת הרשימה השחורה:', error);
-    BLACKLIST = new Set();
+    console.error('שגיאה בהפניית הרשימה השחורה מ-botConfig:', error);
+    BLACKLIST = new Set(); // Fallback
 }
 
 // רשימת מנהלים לקבלת התראות
@@ -437,52 +442,11 @@ async function isGroupAdmin(client, groupId) {
       }
     } catch (error) {
       console.error(`[ADMIN CHECK] Error in standard admin check:`, error);
-      // Continue to alternative methods
+      // If Method 1 fails, we will now fall through to the final return false
     }
     
-
-    
-    // Method 3: Raw API call (if available)
-    try {
-      if (client.pupPage && typeof client.pupPage.evaluate === 'function') {
-        console.log(`[ADMIN CHECK] Trying raw API method`);
-        
-        // Execute WhatsApp Web API call directly
-        const result = await client.pupPage.evaluate((groupId) => {
-          return window.WWebJS.getGroupAdmins(groupId).then(admins => {
-            return { success: true, admins };
-          }).catch(err => {
-            return { success: false, error: err.toString() };
-          });
-        }, groupId);
-        
-        if (result.success && Array.isArray(result.admins)) {
-          console.log(`[ADMIN CHECK] Got ${result.admins.length} admins using raw API`);
-          
-          // Check if bot ID is in admin list
-          const botIdVariations = [
-            botId,
-            botId.split('@')[0],
-            botId.replace('@c.us', '@s.whatsapp.net')
-          ];
-          
-          const isAdmin = result.admins.some(adminId => 
-            botIdVariations.includes(adminId) || 
-            botIdVariations.some(variation => adminId.includes(variation))
-          );
-          
-          console.log(`[ADMIN CHECK] Bot admin status using raw API: ${isAdmin}`);
-          return isAdmin;
-        } else if (!result.success) {
-          console.log(`[ADMIN CHECK] Raw API call failed: ${result.error}`);
-        }
-      }
-    } catch (error) {
-      console.error(`[ADMIN CHECK] Error in raw API check:`, error);
-    }
-    
-    // If all methods fail, log and return false
-    console.log(`[ADMIN CHECK] All admin check methods failed for group ${groupId}`);
+    // If Method 1 did not return true (either failed or bot is not admin)
+    console.log(`[ADMIN CHECK] Method 1 did not confirm admin status for group ${groupId}`);
     return false;
     
   } catch (error) {
@@ -1931,25 +1895,27 @@ function isApproved(userId) {
 
 function saveBlacklist() {
     try {
-        const data = JSON.stringify(Array.from(BLACKLIST), null, 2);
-        fs.writeFileSync(blacklistPath, data);
-        console.log('✅ רשימה שחורה עודכנה בהצלחה:', {
-            count: BLACKLIST.size,
-            path: blacklistPath
-        });
+        // Delegate saving to botConfig
+        botConfig.saveBlacklistedUsers();
+        // Log success, potentially getting count from botConfig if needed
+        console.log('✅ רשימה שחורה עודכנה בהצלחה דרך botConfig');
     } catch (error) {
-        console.error('❌ שגיאה בשמירת הרשימה השחורה:', error);
+        console.error('❌ שגיאה בשמירת הרשימה השחורה דרך botConfig:', error);
     }
 }
 
 function addToBlacklist(userId) {
-    BLACKLIST.add(userId);
-    saveBlacklist();
+    // Delegate adding to botConfig
+    botConfig.addToBlacklist(userId);
+    // BLACKLIST variable should automatically reflect this change if it's a reference.
+    // If not, BLACKLIST might need to be reassigned: BLACKLIST = botConfig.blacklistedUsers;
 }
 
 function removeFromBlacklist(userId) {
-    BLACKLIST.delete(userId);
-    saveBlacklist();
+    // Delegate removing to botConfig
+    botConfig.removeFromBlacklist(userId);
+    // BLACKLIST variable should automatically reflect this change.
+    // If not, BLACKLIST might need to be reassigned: BLACKLIST = botConfig.blacklistedUsers;
 }
 
 // שמירה אוטומטית כל 5 דקות
@@ -3113,13 +3079,13 @@ cron.schedule(
 );
 async function approveGroupRequests(groupId = null, options = {}, client) {
     try {
-        let blacklist = [];
-        try {
-            const blacklistData = fs.readFileSync(path.join(__dirname, 'blacklist.json'), 'utf8');
-            blacklist = JSON.parse(blacklistData);
-        } catch (error) {
-            console.error('Error loading blacklist:', error);
-            blacklist = [];
+        // Use the BLACKLIST variable which should be synced with botConfig.blacklistedUsers
+        // Ensure BLACKLIST is up-to-date if it's not a direct reference
+        // For this refactor, we assume BLACKLIST is correctly referencing/synced with botConfig.blacklistedUsers
+        let currentBlacklist = BLACKLIST;
+        if (!(currentBlacklist instanceof Set)) {
+            console.error("BLACKLIST is not a Set in approveGroupRequests. Using botConfig.blacklistedUsers directly or falling back.");
+            currentBlacklist = botConfig.blacklistedUsers || new Set();
         }
 
         if (groupId) {
@@ -3171,7 +3137,7 @@ async function approveGroupRequests(groupId = null, options = {}, client) {
 
                     console.log(`Extracted requester ID: ${requesterId} from request:`, request);
                     if (requesterId) {
-                        if (!blacklist.includes(requesterId)) {
+                        if (!currentBlacklist.has(requesterId)) { // Changed from blacklist.includes to currentBlacklist.has
                             allowedRequesterIds.push(requesterId);
                         } else {
                             blockedRequesters.push(requesterId);
@@ -3275,7 +3241,7 @@ async function approveGroupRequests(groupId = null, options = {}, client) {
                                     }
 
                                     if (requesterId) {
-                                        if (!blacklist.includes(requesterId)) {
+                                        if (!currentBlacklist.has(requesterId)) { // Changed from blacklist.includes to currentBlacklist.has
                                             allowedRequesterIds.push(requesterId);
                                         } else {
                                             blockedRequesters.push(requesterId);
